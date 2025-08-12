@@ -1,108 +1,125 @@
-import streamlit as st
+from flask import Flask, render_template, request, send_file
 import os
 import datetime
-import io
-import markdown
+import markdown   # pip install markdown
+
 from pydub import AudioSegment
 import speech_recognition as sr
-from summarizer import generate_minutes  # Your existing function
-from xhtml2pdf import pisa
 
-# Ensure uploads folder exists
+from summarizer import generate_minutes
+
+# PDF generation imports
+from xhtml2pdf import pisa
+import io
+
+app = Flask(__name__)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-st.set_page_config(page_title="Meeting Minutes Generator", layout="wide")
-st.title("📄 Meeting Minutes Generator")
+@app.route("/", methods=["GET", "POST"])
+def index():
+    # Defaults so the form “remembers” your inputs
+    date_str     = datetime.date.today().isoformat()
+    attendees    = ""
+    topic        = ""
+    transcript   = None
+    chunk_texts  = []
+    summary_html = None
 
-# --- Form Inputs ---
-with st.form("upload_form", clear_on_submit=False):
-    audio_file = st.file_uploader("Audio/Video file (.wav, .m4a, .mp4)",
-                                  type=["wav", "m4a", "mp4"])
-    date_str = st.date_input("Date", datetime.date.today())
-    topic = st.text_input("Topic", placeholder="E.g. AI Demos")
-    attendees = st.text_input("Attendees (comma-separated)")
-    submit_btn = st.form_submit_button("Upload & Generate")
+    if request.method == "POST":
+        file      = request.files.get("audio_file")
+        date_str  = request.form.get("date", date_str)
+        attendees = request.form.get("attendees", "").strip()
+        topic     = request.form.get("topic", "").strip()
 
-transcript = None
-chunk_texts = []
-summary_html = None
+        # accept wav, m4a, mp4
+        if file and file.filename.lower().endswith((".wav", ".m4a", ".mp4")):
+            # --- Save upload ---
+            input_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+            file.save(input_path)
 
-if submit_btn and audio_file:
-    file_path = os.path.join(UPLOAD_FOLDER, audio_file.name)
-    with open(file_path, "wb") as f:
-        f.write(audio_file.getbuffer())
+            # --- Convert to .wav if needed ---
+            ext = os.path.splitext(input_path)[1].lower()
+            if ext in (".m4a", ".mp4"):
+                wav_path = os.path.join(app.config['UPLOAD_FOLDER'], "converted_audio.wav")
+                # pydub will use ffmpeg under the hood to extract audio from m4a or mp4
+                audio = AudioSegment.from_file(input_path, format=ext[1:])
+                audio.export(wav_path, format="wav")
+            else:
+                # already .wav
+                wav_path = input_path
 
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext in (".m4a", ".mp4"):
-        wav_path = os.path.join(UPLOAD_FOLDER, "converted_audio.wav")
-        audio = AudioSegment.from_file(file_path, format=ext[1:])
-        audio.export(wav_path, format="wav")
-    else:
-        wav_path = file_path
+            # --- Chunked transcription ---
+            recognizer      = sr.Recognizer()
+            full_transcript = ""
+            with sr.AudioFile(wav_path) as source:
+                duration, offset, idx = int(source.DURATION), 0, 1
+                while offset < duration:
+                    chunk = recognizer.record(source, duration=60)
+                    try:
+                        text = recognizer.recognize_google(chunk)
+                    except sr.UnknownValueError:
+                        text = ""
+                    except sr.RequestError as e:
+                        text = f"[API error: {e}]"
+                        break
 
-    recognizer = sr.Recognizer()
-    full_transcript = ""
+                    print(f"Chunk {idx} ({offset}-{min(offset+60, duration)}s): {text}")
+                    full_transcript += text + " "
+                    chunk_texts.append(text)
 
-    with sr.AudioFile(wav_path) as source:
-        duration, offset, idx = int(source.DURATION), 0, 1
-        while offset < duration:
-            chunk = recognizer.record(source, duration=60)
-            try:
-                text = recognizer.recognize_google(chunk)
-            except sr.UnknownValueError:
-                text = ""
-            except sr.RequestError as e:
-                text = f"[API error: {e}]"
-                break
+                    offset += 60
+                    idx    += 1
 
-            full_transcript += text + " "
-            chunk_texts.append(text)
-            offset += 60
-            idx += 1
+            transcript = full_transcript
 
-    transcript = full_transcript
-    summary_md = generate_minutes(transcript, date_str, attendees, topic)
-    summary_html = markdown.markdown(summary_md, extensions=["extra", "sane_lists"])
+            # --- Generate & render summary ---
+            summary_md   = generate_minutes(transcript, date_str, attendees, topic)
+            summary_html = markdown.markdown(
+                summary_md,
+                extensions=["extra", "sane_lists"]
+            )
 
-if transcript:
-    col1, col2 = st.columns(2)
+    return render_template(
+        "index.html",
+        date=date_str,
+        attendees=attendees,
+        topic=topic,
+        transcript=transcript,
+        chunk_texts=chunk_texts,
+        summary_html=summary_html
+    )
 
-    with col1:
-        st.subheader("Minute-by-minute Transcript")
-        for c in chunk_texts:
-            st.write(f"- {c}")
+@app.route("/download", methods=["POST"])
+def download_pdf():
+    html_body = request.form.get("summary_html", "")
+    full_html = f"""
+    <!DOCTYPE html><html><head>
+      <meta charset="utf-8"><title>Meeting Minutes</title>
+      <style>
+        body {{ font-family: sans-serif; margin: 2em; }}
+        h1,h2,h3 {{ margin-bottom: .5em; }}
+        hr {{ border: none; border-top: 1px solid #ccc; margin: 1em 0; }}
+        ul,ol {{ margin-left: 1.5em; }}
+        strong {{ font-weight: bold; }}
+      </style>
+    </head><body>
+      {html_body}
+    </body></html>
+    """
+    pdf_buffer = io.BytesIO()
+    status = pisa.CreatePDF(full_html, dest=pdf_buffer)
+    if status.err:
+        return "Error generating PDF", 500
 
-        st.subheader("Full Transcript")
-        st.code(transcript, language="text")
+    pdf_buffer.seek(0)
+    return send_file(
+        pdf_buffer,
+        as_attachment=True,
+        download_name="meeting_minutes.pdf",
+        mimetype="application/pdf"
+    )
 
-    with col2:
-        st.subheader("Meeting Minutes Summary")
-        st.markdown(summary_html, unsafe_allow_html=True)
-
-        # PDF Download
-        def create_pdf(html_content):
-            full_html = f"""
-            <!DOCTYPE html><html><head>
-              <meta charset="utf-8"><title>Meeting Minutes</title>
-              <style>
-                body {{ font-family: sans-serif; margin: 2em; }}
-                h1,h2,h3 {{ margin-bottom: .5em; }}
-                hr {{ border: none; border-top: 1px solid #ccc; margin: 1em 0; }}
-                ul,ol {{ margin-left: 1.5em; }}
-                strong {{ font-weight: bold; }}
-              </style>
-            </head><body>
-              {html_content}
-            </body></html>
-            """
-            pdf_buffer = io.BytesIO()
-            pisa.CreatePDF(full_html, dest=pdf_buffer)
-            pdf_buffer.seek(0)
-            return pdf_buffer
-
-        pdf_file = create_pdf(summary_html)
-        st.download_button("📄 Download as PDF",
-                           data=pdf_file,
-                           file_name="meeting_minutes.pdf",
-                           mime="application/pdf")
+if __name__ == "__main__":
+    app.run(debug=True)
